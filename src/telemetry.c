@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -143,5 +144,40 @@ size_t tm_snapshot_json(char *buf, size_t n) {
     o += put_num(buf + o, n - o, "frametime_ms", last, 0);
     o += put_num(buf + o, n - o, "frametime_avg_ms", avg, 1);
     o += snprintf(buf + o, n - o, "}");
+    return o;
+}
+
+/* ---- Diagnostics: read-only probe of system counters. Refused names show
+ *      ok:false with the errno, so we learn what 13.60 allows before
+ *      building anything on top of it. ---- */
+static const char *PROBES[] = {
+    "hw.physmem", "hw.usermem", "hw.realmem", "hw.pagesize", "hw.ncpu", "hw.model",
+    "vm.stats.vm.v_page_size", "vm.stats.vm.v_page_count", "vm.stats.vm.v_free_count",
+    "vm.stats.vm.v_inactive_count", "vm.stats.vm.v_active_count", "vm.stats.vm.v_wire_count",
+    "vm.kmem_size", "kern.cp_time", "kern.cp_times", "kern.smp.cpus",
+    "dev.cpu.0.freq", "kern.boottime", "kern.osrelease", NULL
+};
+
+size_t tm_diag_json(char *buf, size_t n) {
+    size_t o = (size_t)snprintf(buf, n, "{\"sysctl\":{");
+    for (int i = 0; PROBES[i] && o + 200 < n; i++) {
+        unsigned char raw[256];
+        size_t len = sizeof(raw);
+        memset(raw, 0, sizeof(raw));
+        int rc = sysctlbyname(PROBES[i], raw, &len, NULL, 0);
+        int e = errno;
+        const char *sep = PROBES[i + 1] ? "," : "";
+        if (rc == 0) {
+            char hex[33] = {0};
+            size_t k = len < 16 ? len : 16;
+            for (size_t j = 0; j < k; j++) snprintf(hex + 2 * j, 3, "%02x", raw[j]);
+            o += (size_t)snprintf(buf + o, n - o, "\"%s\":{\"ok\":true,\"len\":%zu,\"hex\":\"%s\"}%s",
+                                  PROBES[i], len, hex, sep);
+        } else {
+            o += (size_t)snprintf(buf + o, n - o, "\"%s\":{\"ok\":false,\"errno\":%d}%s",
+                                  PROBES[i], e, sep);
+        }
+    }
+    o += (size_t)snprintf(buf + o, n - o, "}}");
     return o;
 }

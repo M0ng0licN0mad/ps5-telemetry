@@ -23,6 +23,15 @@ Install ps5-payload-sdk, then: `export PS5_PAYLOAD_SDK=/path/to/sdk && make`
 
 Test frame time without a hook: `while true; do echo . | nc -u -w0 <PS5-IP> 9091; sleep 0.0166; done`
 
+## Diagnostics
+`GET /diag` tries a list of system counters and reports which ones this console allows
+(`ok:true` with raw bytes, or `ok:false` with the errno). Run `curl http://<PS5-IP>:9090/diag`
+and use the result to decide which sources work. Read-only.
+
+Reported by ps5-exporter on 13.60: the `hw.physmem` and `hw.usermem` sysctls are refused for
+payloads, so RAM may show n/a until a working source is found. CPU and GPU load, FPS and fan
+speed are reported to come from kernel memory at firmware-specific offsets.
+
 ## Roadmap
 - Frame hook: in-game plugin that hooks the flip call and sends one UDP packet per flip.
 - GPU busy %: sample the GPU status busy bit at high rate and report the busy fraction (radeontop method). Firmware-specific.

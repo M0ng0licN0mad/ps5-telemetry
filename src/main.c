@@ -68,6 +68,10 @@ int main(void) {
                 char body[512];
                 size_t len = tm_snapshot_json(body, sizeof(body));
                 reply(c, 200, "application/json", body, len);
+            } else if (!strncmp(req, "GET /diag", 9)) {
+                char dbuf[4096];
+                size_t len = tm_diag_json(dbuf, sizeof(dbuf));
+                reply(c, 200, "application/json", dbuf, len);
             } else if (!strncmp(req, "GET / ", 6) || !strncmp(req, "GET /?", 6)) {
                 reply(c, 200, "text/html; charset=utf-8", DASHBOARD_HTML, DASHBOARD_LEN);
             } else {
