@@ -1,0 +1,3 @@
+telemetry.elf
+src/dashboard.h
+*.o
