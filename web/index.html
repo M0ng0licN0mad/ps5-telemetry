@@ -29,12 +29,12 @@ const BASE=P?'http://'+P+':9090':'';
 const N=90;
 let memGB=false;
 const M=[
- {k:'cpu',l:'CPU',u:'%',c:'#5aa9ff',max:()=>100,v:d=>d.cpu,sub:d=>d.cpu==null?'Warming up':'Estimated from process run time'},
+ {k:'cpu',l:'CPU',u:'%',c:'#5aa9ff',max:()=>100,v:d=>d.cpu,sub:d=>d.cpu==null?'Warming up':'Share of all CPU threads used by '+(d.proc_name||'the largest process')},
  {k:'gpu',l:'GPU',u:'%',c:'#b48cff',max:()=>100,v:d=>d.gpu,sub:d=>d.gpu==null?'No GPU source yet (see README)':''},
  {k:'ram',l:'Memory',u:'%',c:'#4fd1a5',max:()=>memGB?Math.max(8,...M[2].h.filter(x=>x!=null)):100,
   v:d=>{memGB=!d.ram_total_mb;return d.ram_total_mb?100*d.ram_used_mb/d.ram_total_mb:(d.ram_used_mb==null?null:d.ram_used_mb/1024)},
   uf:()=>memGB?' GB':'%',
-  sub:d=>d.ram_total_mb?(d.ram_used_mb/1024).toFixed(1)+' of '+(d.ram_total_mb/1024).toFixed(1)+' GB':(d.ram_used_mb==null?'Memory counters unavailable':'Resident memory of all processes (approx.)')},
+  sub:d=>d.ram_total_mb?(d.ram_used_mb/1024).toFixed(1)+' of '+(d.ram_total_mb/1024).toFixed(1)+' GB':(d.ram_used_mb==null?'Memory counters unavailable':'Resident memory of '+(d.proc_name||'the largest process')+' (approx.)')},
  {k:'ft',l:'Frame time',u:'ms',c:'#ffb454',max:h=>Math.max(33.3,...h.filter(x=>x!=null)),v:d=>d.frametime_ms,
   sub:d=>d.frametime_ms==null?'Waiting for frame data':(1000/d.frametime_avg_ms).toFixed(0)+' fps average'}
 ];

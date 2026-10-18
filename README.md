@@ -33,7 +33,7 @@ payloads, so RAM may show n/a until a working source is found. CPU and GPU load,
 speed are reported to come from kernel memory at firmware-specific offsets.
 
 On 13.60 the kernel has no `kern.cp_time`, `hw.physmem` or `vm.stats.*` sysctls (errno 2, not found),
-so CPU % is estimated from the process table (`kern.proc.all`) and memory shows resident memory of all processes.
+so CPU % and memory come from the process table (`KERN_PROC_PROC`): the process with the largest resident memory is treated as the game, CPU % is its run-time delta over total logical CPU capacity, and memory is its resident pages. 13.60 returns 1096-byte process records (SDK struct is 1088), so records are read by their declared length. Approach follows TacHen (GPL-3.0); no code copied.
 - `GET /procs`: process-table probe (struct size check, top processes by run time and by resident memory).
 - `GET /sysctls?q=mem`: lists sysctl names containing `mem` (names only). Try `q=gpu`, `q=cpu`, `q=dmem`.
 

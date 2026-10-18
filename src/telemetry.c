@@ -6,6 +6,7 @@
 #include <time.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <stddef.h>
 #if defined(__has_include)
 # if __has_include(<sys/user.h>)
 #  include <sys/param.h>
@@ -28,6 +29,8 @@ static int      ft_head = 0, ft_count = 0;
 static uint64_t last_flip_ns = 0;
 static double   g_ram_total_mb = -1, g_ram_used_mb = -1;
 static int      g_ncpu = 0, g_pagesz = 0;
+static int      g_proc_pid = 0;
+static char     g_proc_name[24] = "";
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -79,61 +82,90 @@ static double sample_gpu(void) { return -1; }
 
 #ifdef HAVE_KINFO
 #define MAXP 1024
-typedef struct { int pid; uint64_t rt; } pstat_t;
+typedef struct { int pid; char comm[24]; uint64_t runtime; int64_t rss; } pinfo_t;
 static pthread_mutex_t pmu = PTHREAD_MUTEX_INITIALIZER;
-static pstat_t prevp[MAXP], curp[MAXP];
-static int nprev = 0, kp_ok = 1;
-static uint64_t prev_us = 0;
-static struct kinfo_proc *kp = NULL;
-static size_t kp_cap = 0, kp_n = 0;
+static pinfo_t procs[MAXP];
+static size_t nprocs = 0, raw_bytes = 0;
+static unsigned char *rawbuf = NULL;
+static size_t rawcap = 0;
+static int last_stage = 0, last_errno = 0, first_len = 0;
 
-/* Caller holds pmu. Standard FreeBSD process table, read-only. */
+/* Caller holds pmu. PS5 13.60 returns 1096-byte process records while the SDK
+ * struct is 1088 bytes, so walk the table by each record's own declared length
+ * and copy the common prefix (same approach TacHen uses). */
 static int read_procs(void) {
-    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
     size_t need = 0, len;
-    if (!kp_ok || sysctl(mib, 3, NULL, &need, NULL, 0) != 0) return -1;
-    need += need / 4 + 8192;
-    if (need > kp_cap) {
-        free(kp);
-        kp = malloc(need);
-        kp_cap = kp ? need : 0;
-        if (!kp) return -1;
+    nprocs = 0; raw_bytes = 0; first_len = 0;
+    if (sysctl(mib, 4, NULL, &need, NULL, 0) != 0) { last_stage = 1; last_errno = errno; return -1; }
+    if (need < sizeof(int) || need > 16u * 1024 * 1024) { last_stage = 2; last_errno = EINVAL; return -1; }
+    size_t cap = need + need / 4;
+    if (cap > rawcap) {
+        free(rawbuf);
+        rawbuf = malloc(cap);
+        rawcap = rawbuf ? cap : 0;
+        if (!rawbuf) { last_stage = 3; last_errno = ENOMEM; return -1; }
     }
-    len = kp_cap;
-    if (sysctl(mib, 3, kp, &len, NULL, 0) != 0) return -1;
-    kp_n = len / sizeof(struct kinfo_proc);
-    for (size_t i = 0; i < kp_n; i++)
-        if (kp[i].ki_structsize != (int)sizeof(struct kinfo_proc)) { kp_ok = 0; kp_n = 0; return -1; }
+    len = rawcap;
+    if (sysctl(mib, 4, rawbuf, &len, NULL, 0) != 0) { last_stage = 4; last_errno = errno; return -1; }
+    raw_bytes = len;
+    const size_t min_len = offsetof(struct kinfo_proc, ki_comm) + COMMLEN + 1;
+    size_t off = 0;
+    while (off + sizeof(int) <= len && nprocs < MAXP) {
+        int reclen;
+        memcpy(&reclen, rawbuf + off, sizeof(reclen));
+        if (!first_len) first_len = reclen;
+        if (reclen < (int)min_len || (size_t)reclen > len - off) {
+            last_stage = 5; last_errno = EINVAL;
+            return nprocs ? 0 : -1;
+        }
+        struct kinfo_proc info;
+        memset(&info, 0, sizeof(info));
+        memcpy(&info, rawbuf + off, (size_t)reclen < sizeof(info) ? (size_t)reclen : sizeof(info));
+        if (info.ki_pid > 0) {
+            pinfo_t *p = &procs[nprocs++];
+            p->pid = info.ki_pid;
+            p->runtime = (uint64_t)info.ki_runtime;
+            p->rss = (int64_t)info.ki_rssize;
+            size_t j = 0;
+            for (; j < sizeof(p->comm) - 1 && j < COMMLEN && info.ki_comm[j]; j++) {
+                char ch = info.ki_comm[j];
+                p->comm[j] = (ch >= 32 && ch < 127 && ch != '"' && ch != '\\') ? ch : '?';
+            }
+            p->comm[j] = 0;
+        }
+        off += (size_t)reclen;
+    }
+    last_stage = 0; last_errno = 0;
     return 0;
 }
 
-/* CPU% = run time added by all non-idle processes / (wall time * logical CPUs).
- * Approximate. Memory = resident pages of all processes. */
-static void sample_procs(double *cpu, double *rss_mb) {
+/* The "game" is the process with the largest resident memory (kept sticky so it
+ * does not flip). CPU % = its run-time delta / (wall time * logical CPUs), the same
+ * definition TacHen uses. RAM = its resident pages. */
+static int game_pid = 0, have_prev = 0;
+static uint64_t prev_us = 0, prev_rt = 0;
+
+static void sample_procs(double *cpu, double *rss_mb, int *pid, char *name) {
     *cpu = *rss_mb = -1;
     pthread_mutex_lock(&pmu);
-    if (read_procs() == 0) {
-        uint64_t t = now_ns() / 1000, d = 0;
-        double pages = 0;
-        int nc = 0;
-        for (size_t i = 0; i < kp_n; i++) {
-            pages += (double)kp[i].ki_rssize;
-            if (!strcmp(kp[i].ki_comm, "idle") || nc >= MAXP) continue;
-            uint64_t rt = (uint64_t)kp[i].ki_runtime;
-            curp[nc].pid = kp[i].ki_pid;
-            curp[nc].rt = rt;
-            nc++;
-            for (int j = 0; j < nprev; j++)
-                if (prevp[j].pid == kp[i].ki_pid) { if (rt >= prevp[j].rt) d += rt - prevp[j].rt; break; }
+    if (read_procs() == 0 && nprocs) {
+        int best = 0, cur = -1;
+        for (size_t i = 0; i < nprocs; i++) {
+            if (procs[i].rss > procs[best].rss) best = (int)i;
+            if (procs[i].pid == game_pid) cur = (int)i;
         }
-        if (prev_us && t > prev_us && g_ncpu > 0) {
-            double c = 100.0 * ((double)d / (double)(t - prev_us)) / g_ncpu;
+        int pick = (cur >= 0 && procs[cur].rss * 2 >= procs[best].rss) ? cur : best;
+        uint64_t t = now_ns() / 1000;
+        if (procs[pick].pid != game_pid) { game_pid = procs[pick].pid; have_prev = 0; }
+        if (have_prev && t > prev_us && procs[pick].runtime >= prev_rt && g_ncpu > 0) {
+            double c = 100.0 * ((double)(procs[pick].runtime - prev_rt) / (double)(t - prev_us)) / g_ncpu;
             *cpu = c > 100 ? 100 : c;
         }
-        memcpy(prevp, curp, sizeof(pstat_t) * (size_t)nc);
-        nprev = nc;
-        prev_us = t;
-        if (g_pagesz > 0) *rss_mb = pages * g_pagesz / 1048576.0;
+        prev_rt = procs[pick].runtime; prev_us = t; have_prev = 1;
+        if (g_pagesz > 0) *rss_mb = (double)procs[pick].rss * g_pagesz / 1048576.0;
+        *pid = procs[pick].pid;
+        snprintf(name, 24, "%s", procs[pick].comm);
     }
     pthread_mutex_unlock(&pmu);
 }
@@ -144,24 +176,17 @@ static size_t emit_top(char *buf, size_t o, size_t n, int by_rss, int k) {
     for (int r = 0; r < k && o + 200 < n; r++) {
         int best = -1;
         double bv = -1;
-        for (size_t i = 0; i < kp_n && i < MAXP; i++) {
+        for (size_t i = 0; i < nprocs; i++) {
             if (used[i]) continue;
-            double v = by_rss ? (double)kp[i].ki_rssize : (double)kp[i].ki_runtime;
+            double v = by_rss ? (double)procs[i].rss : (double)procs[i].runtime;
             if (v > bv) { bv = v; best = (int)i; }
         }
         if (best < 0) break;
         used[best] = 1;
-        char nm[24];
-        size_t j = 0;
-        for (; j < sizeof(nm) - 1 && kp[best].ki_comm[j]; j++) {
-            char ch = kp[best].ki_comm[j];
-            nm[j] = (ch >= 32 && ch < 127 && ch != '"' && ch != '\\') ? ch : '?';
-        }
-        nm[j] = 0;
         o += (size_t)snprintf(buf + o, n - o,
-            "%s{\"pid\":%d,\"comm\":\"%s\",\"runtime_us\":%llu,\"rss_pages\":%ld}",
-            r ? "," : "", (int)kp[best].ki_pid, nm,
-            (unsigned long long)kp[best].ki_runtime, (long)kp[best].ki_rssize);
+            "%s{\"pid\":%d,\"comm\":\"%s\",\"runtime_us\":%llu,\"rss_pages\":%lld}",
+            r ? "," : "", procs[best].pid, procs[best].comm,
+            (unsigned long long)procs[best].runtime, (long long)procs[best].rss);
     }
     return o;
 }
@@ -172,11 +197,13 @@ size_t tm_procs_json(char *buf, size_t n) {
     pthread_mutex_lock(&pmu);
     int rc = read_procs();
     size_t o = (size_t)snprintf(buf, n,
-        "{\"ok\":%s,\"structsize_expected\":%zu,\"count\":%zu,\"ncpu\":%d,\"pagesize\":%d,\"top_runtime\":[",
-        rc == 0 ? "true" : "false", sizeof(struct kinfo_proc), kp_n, g_ncpu, g_pagesz);
-    if (rc == 0) o = emit_top(buf, o, n, 0, 8);
-    o += (size_t)snprintf(buf + o, n - o, "],\"top_rss\":[");
-    if (rc == 0) o = emit_top(buf, o, n, 1, 5);
+        "{\"ok\":%s,\"stage\":%d,\"errno\":%d,\"bytes\":%zu,\"first_record_len\":%d,"
+        "\"sdk_struct_len\":%zu,\"count\":%zu,\"ncpu\":%d,\"pagesize\":%d,\"top_rss\":[",
+        rc == 0 ? "true" : "false", last_stage, last_errno, raw_bytes, first_len,
+        sizeof(struct kinfo_proc), nprocs, g_ncpu, g_pagesz);
+    o = emit_top(buf, o, n, 1, 6);
+    o += (size_t)snprintf(buf + o, n - o, "],\"top_runtime\":[");
+    o = emit_top(buf, o, n, 0, 8);
     o += (size_t)snprintf(buf + o, n - o, "]}");
     pthread_mutex_unlock(&pmu);
     return o;
@@ -215,8 +242,10 @@ static void *sampler(void *arg) {
     if (sysctl_u64("hw.pagesize", &v) == 0) g_pagesz = (int)v;
     for (;;) {
         double c = -1, rss = -1, g = sample_gpu();
+        int ppid = 0;
+        char pname[24] = "";
 #ifdef HAVE_KINFO
-        sample_procs(&c, &rss);
+        sample_procs(&c, &rss, &ppid, pname);
 #endif
         if (c < 0) c = sample_cpu();          /* kern.cp_time: absent on 13.60, kept as fallback */
         uint64_t t, u;
@@ -224,6 +253,7 @@ static void *sampler(void *arg) {
         double rt = t ? t / 1048576.0 : -1, ru = t ? u / 1048576.0 : (rss >= 0 ? rss : -1);
         pthread_mutex_lock(&mu);
         g_cpu = c; g_gpu = g; g_ram_total_mb = rt; g_ram_used_mb = ru;
+        g_proc_pid = ppid; memcpy(g_proc_name, pname, sizeof(g_proc_name));
         pthread_mutex_unlock(&mu);
         usleep(500000);
     }
@@ -273,6 +303,9 @@ static int put_num(char *p, size_t n, const char *key, double v, int last) {
 size_t tm_snapshot_json(char *buf, size_t n) {
     pthread_mutex_lock(&mu);
     double cpu = g_cpu, gpu = g_gpu, last = -1, avg = -1;
+    int ppid = g_proc_pid;
+    char pname[24];
+    memcpy(pname, g_proc_name, sizeof(pname));
     double rtot = g_ram_total_mb, rused = g_ram_used_mb;
     int fresh = ft_count > 0 && (now_ns() - last_flip_ns) < 2000000000ULL;
     if (fresh) {
@@ -290,7 +323,8 @@ size_t tm_snapshot_json(char *buf, size_t n) {
     o += put_num(buf + o, n - o, "ram_total_mb", rtot, 0);
     o += put_num(buf + o, n - o, "ram_used_mb", rused, 0);
     o += put_num(buf + o, n - o, "frametime_ms", last, 0);
-    o += put_num(buf + o, n - o, "frametime_avg_ms", avg, 1);
+    o += put_num(buf + o, n - o, "frametime_avg_ms", avg, 0);
+    o += (size_t)snprintf(buf + o, n - o, "\"proc_pid\":%d,\"proc_name\":\"%s\"", ppid, pname);
     o += snprintf(buf + o, n - o, "}");
     return o;
 }
