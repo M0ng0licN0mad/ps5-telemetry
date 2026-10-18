@@ -38,6 +38,12 @@ static void reply(int fd, int code, const char *type, const void *body, size_t l
     send_all(fd, body, len);
 }
 
+static void emit_line(void *ctx, const char *s) {
+    int fd = *(int *)ctx;
+    send_all(fd, s, strlen(s));
+    send_all(fd, "\n", 1);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     tm_start();
@@ -68,6 +74,24 @@ int main(void) {
                 char body[512];
                 size_t len = tm_snapshot_json(body, sizeof(body));
                 reply(c, 200, "application/json", body, len);
+            } else if (!strncmp(req, "GET /procs", 10)) {
+                char pbuf[4096];
+                size_t len = tm_procs_json(pbuf, sizeof(pbuf));
+                reply(c, 200, "application/json", pbuf, len);
+            } else if (!strncmp(req, "GET /sysctls", 12)) {
+                char q[48] = "";
+                const char *eol = strpbrk(req, "\r\n");
+                const char *p = strstr(req, "q=");
+                if (p && (!eol || p < eol)) {
+                    size_t i = 0;
+                    p += 2;
+                    while (*p && *p != ' ' && *p != '&' && *p != '\r' && i < sizeof(q) - 1) q[i++] = *p++;
+                    q[i] = 0;
+                }
+                const char *h = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n"
+                                "Access-Control-Allow-Origin: *\r\n\r\n";
+                send_all(c, h, strlen(h));
+                tm_sysctl_walk(q, emit_line, &c);
             } else if (!strncmp(req, "GET /diag", 9)) {
                 char dbuf[4096];
                 size_t len = tm_diag_json(dbuf, sizeof(dbuf));

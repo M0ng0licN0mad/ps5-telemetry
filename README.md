@@ -32,6 +32,11 @@ Reported by ps5-exporter on 13.60: the `hw.physmem` and `hw.usermem` sysctls are
 payloads, so RAM may show n/a until a working source is found. CPU and GPU load, FPS and fan
 speed are reported to come from kernel memory at firmware-specific offsets.
 
+On 13.60 the kernel has no `kern.cp_time`, `hw.physmem` or `vm.stats.*` sysctls (errno 2, not found),
+so CPU % is estimated from the process table (`kern.proc.all`) and memory shows resident memory of all processes.
+- `GET /procs`: process-table probe (struct size check, top processes by run time and by resident memory).
+- `GET /sysctls?q=mem`: lists sysctl names containing `mem` (names only). Try `q=gpu`, `q=cpu`, `q=dmem`.
+
 ## Roadmap
 - Frame hook: in-game plugin that hooks the flip call and sends one UDP packet per flip.
 - GPU busy %: sample the GPU status busy bit at high rate and report the busy fraction (radeontop method). Firmware-specific.

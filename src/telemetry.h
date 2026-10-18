@@ -8,5 +8,7 @@
 void   tm_start(void);                       /* starts sampler + flip listener threads */
 void   tm_frame_flip(void);                  /* call once per presented frame */
 size_t tm_snapshot_json(char *buf, size_t n);/* returns bytes written */
-size_t tm_diag_json(char *buf, size_t n);    /* probes which sysctls this console allows */
+size_t tm_diag_json(char *buf, size_t n);
+size_t tm_procs_json(char *buf, size_t n);  /* process-table probe */
+void   tm_sysctl_walk(const char *filter, void (*emit)(void *, const char *), void *ctx);    /* probes which sysctls this console allows */
 #endif

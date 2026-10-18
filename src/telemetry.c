@@ -5,6 +5,14 @@
 #include <stdint.h>
 #include <time.h>
 #include <errno.h>
+#include <stdlib.h>
+#if defined(__has_include)
+# if __has_include(<sys/user.h>)
+#  include <sys/param.h>
+#  include <sys/user.h>
+#  define HAVE_KINFO 1
+# endif
+#endif
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -15,10 +23,11 @@
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static double   g_cpu = -1, g_gpu = -1;
-static uint64_t g_ram_total = 0, g_ram_used = 0;
 static double   ft_ring[FT_N];
 static int      ft_head = 0, ft_count = 0;
 static uint64_t last_flip_ns = 0;
+static double   g_ram_total_mb = -1, g_ram_used_mb = -1;
+static int      g_ncpu = 0, g_pagesz = 0;
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -68,14 +77,153 @@ static void sample_ram(uint64_t *total, uint64_t *used) {
  *      See README "Roadmap" for the approach. ---- */
 static double sample_gpu(void) { return -1; }
 
+#ifdef HAVE_KINFO
+#define MAXP 1024
+typedef struct { int pid; uint64_t rt; } pstat_t;
+static pthread_mutex_t pmu = PTHREAD_MUTEX_INITIALIZER;
+static pstat_t prevp[MAXP], curp[MAXP];
+static int nprev = 0, kp_ok = 1;
+static uint64_t prev_us = 0;
+static struct kinfo_proc *kp = NULL;
+static size_t kp_cap = 0, kp_n = 0;
+
+/* Caller holds pmu. Standard FreeBSD process table, read-only. */
+static int read_procs(void) {
+    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+    size_t need = 0, len;
+    if (!kp_ok || sysctl(mib, 3, NULL, &need, NULL, 0) != 0) return -1;
+    need += need / 4 + 8192;
+    if (need > kp_cap) {
+        free(kp);
+        kp = malloc(need);
+        kp_cap = kp ? need : 0;
+        if (!kp) return -1;
+    }
+    len = kp_cap;
+    if (sysctl(mib, 3, kp, &len, NULL, 0) != 0) return -1;
+    kp_n = len / sizeof(struct kinfo_proc);
+    for (size_t i = 0; i < kp_n; i++)
+        if (kp[i].ki_structsize != (int)sizeof(struct kinfo_proc)) { kp_ok = 0; kp_n = 0; return -1; }
+    return 0;
+}
+
+/* CPU% = run time added by all non-idle processes / (wall time * logical CPUs).
+ * Approximate. Memory = resident pages of all processes. */
+static void sample_procs(double *cpu, double *rss_mb) {
+    *cpu = *rss_mb = -1;
+    pthread_mutex_lock(&pmu);
+    if (read_procs() == 0) {
+        uint64_t t = now_ns() / 1000, d = 0;
+        double pages = 0;
+        int nc = 0;
+        for (size_t i = 0; i < kp_n; i++) {
+            pages += (double)kp[i].ki_rssize;
+            if (!strcmp(kp[i].ki_comm, "idle") || nc >= MAXP) continue;
+            uint64_t rt = (uint64_t)kp[i].ki_runtime;
+            curp[nc].pid = kp[i].ki_pid;
+            curp[nc].rt = rt;
+            nc++;
+            for (int j = 0; j < nprev; j++)
+                if (prevp[j].pid == kp[i].ki_pid) { if (rt >= prevp[j].rt) d += rt - prevp[j].rt; break; }
+        }
+        if (prev_us && t > prev_us && g_ncpu > 0) {
+            double c = 100.0 * ((double)d / (double)(t - prev_us)) / g_ncpu;
+            *cpu = c > 100 ? 100 : c;
+        }
+        memcpy(prevp, curp, sizeof(pstat_t) * (size_t)nc);
+        nprev = nc;
+        prev_us = t;
+        if (g_pagesz > 0) *rss_mb = pages * g_pagesz / 1048576.0;
+    }
+    pthread_mutex_unlock(&pmu);
+}
+
+static size_t emit_top(char *buf, size_t o, size_t n, int by_rss, int k) {
+    static unsigned char used[MAXP];
+    memset(used, 0, sizeof(used));
+    for (int r = 0; r < k && o + 200 < n; r++) {
+        int best = -1;
+        double bv = -1;
+        for (size_t i = 0; i < kp_n && i < MAXP; i++) {
+            if (used[i]) continue;
+            double v = by_rss ? (double)kp[i].ki_rssize : (double)kp[i].ki_runtime;
+            if (v > bv) { bv = v; best = (int)i; }
+        }
+        if (best < 0) break;
+        used[best] = 1;
+        char nm[24];
+        size_t j = 0;
+        for (; j < sizeof(nm) - 1 && kp[best].ki_comm[j]; j++) {
+            char ch = kp[best].ki_comm[j];
+            nm[j] = (ch >= 32 && ch < 127 && ch != '"' && ch != '\\') ? ch : '?';
+        }
+        nm[j] = 0;
+        o += (size_t)snprintf(buf + o, n - o,
+            "%s{\"pid\":%d,\"comm\":\"%s\",\"runtime_us\":%llu,\"rss_pages\":%ld}",
+            r ? "," : "", (int)kp[best].ki_pid, nm,
+            (unsigned long long)kp[best].ki_runtime, (long)kp[best].ki_rssize);
+    }
+    return o;
+}
+#endif
+
+size_t tm_procs_json(char *buf, size_t n) {
+#ifdef HAVE_KINFO
+    pthread_mutex_lock(&pmu);
+    int rc = read_procs();
+    size_t o = (size_t)snprintf(buf, n,
+        "{\"ok\":%s,\"structsize_expected\":%zu,\"count\":%zu,\"ncpu\":%d,\"pagesize\":%d,\"top_runtime\":[",
+        rc == 0 ? "true" : "false", sizeof(struct kinfo_proc), kp_n, g_ncpu, g_pagesz);
+    if (rc == 0) o = emit_top(buf, o, n, 0, 8);
+    o += (size_t)snprintf(buf + o, n - o, "],\"top_rss\":[");
+    if (rc == 0) o = emit_top(buf, o, n, 1, 5);
+    o += (size_t)snprintf(buf + o, n - o, "]}");
+    pthread_mutex_unlock(&pmu);
+    return o;
+#else
+    return (size_t)snprintf(buf, n, "{\"ok\":false,\"reason\":\"no kinfo_proc in this SDK\"}");
+#endif
+}
+
+/* Walk the kernel's sysctl name table. Names only: no values are read. */
+void tm_sysctl_walk(const char *filter, void (*emit)(void *, const char *), void *ctx) {
+    int nm[CTL_MAXNAME + 2], out[CTL_MAXNAME];
+    size_t l1 = 3;
+    nm[0] = 0; nm[1] = 2; nm[2] = 1;
+    for (int guard = 0; guard < 20000; guard++) {
+        size_t l2 = sizeof(out);
+        if (sysctl(nm, (unsigned)l1, out, &l2, NULL, 0) != 0) break;
+        l2 /= sizeof(int);
+        if (l2 == 0 || l2 > CTL_MAXNAME) break;
+        int nn[CTL_MAXNAME + 2];
+        nn[0] = 0; nn[1] = 1;
+        memcpy(nn + 2, out, l2 * sizeof(int));
+        char name[256];
+        size_t nl = sizeof(name);
+        if (sysctl(nn, (unsigned)(l2 + 2), name, &nl, NULL, 0) == 0 &&
+            (filter[0] == 0 || strstr(name, filter)))
+            emit(ctx, name);
+        memcpy(nm + 2, out, l2 * sizeof(int));
+        l1 = 2 + l2;
+    }
+}
+
 static void *sampler(void *arg) {
     (void)arg;
+    uint64_t v;
+    if (sysctl_u64("hw.ncpu", &v) == 0) g_ncpu = (int)v;
+    if (sysctl_u64("hw.pagesize", &v) == 0) g_pagesz = (int)v;
     for (;;) {
-        double c = sample_cpu(), g = sample_gpu();
+        double c = -1, rss = -1, g = sample_gpu();
+#ifdef HAVE_KINFO
+        sample_procs(&c, &rss);
+#endif
+        if (c < 0) c = sample_cpu();          /* kern.cp_time: absent on 13.60, kept as fallback */
         uint64_t t, u;
-        sample_ram(&t, &u);
+        sample_ram(&t, &u);                   /* vm.* counters: absent on 13.60, kept as fallback */
+        double rt = t ? t / 1048576.0 : -1, ru = t ? u / 1048576.0 : (rss >= 0 ? rss : -1);
         pthread_mutex_lock(&mu);
-        g_cpu = c; g_gpu = g; g_ram_total = t; g_ram_used = u;
+        g_cpu = c; g_gpu = g; g_ram_total_mb = rt; g_ram_used_mb = ru;
         pthread_mutex_unlock(&mu);
         usleep(500000);
     }
@@ -125,7 +273,7 @@ static int put_num(char *p, size_t n, const char *key, double v, int last) {
 size_t tm_snapshot_json(char *buf, size_t n) {
     pthread_mutex_lock(&mu);
     double cpu = g_cpu, gpu = g_gpu, last = -1, avg = -1;
-    uint64_t tot = g_ram_total, used = g_ram_used;
+    double rtot = g_ram_total_mb, rused = g_ram_used_mb;
     int fresh = ft_count > 0 && (now_ns() - last_flip_ns) < 2000000000ULL;
     if (fresh) {
         double sum = 0;
@@ -139,8 +287,8 @@ size_t tm_snapshot_json(char *buf, size_t n) {
     o += snprintf(buf + o, n - o, "{");
     o += put_num(buf + o, n - o, "cpu", cpu, 0);
     o += put_num(buf + o, n - o, "gpu", gpu, 0);
-    o += put_num(buf + o, n - o, "ram_total_mb", tot ? tot / 1048576.0 : -1, 0);
-    o += put_num(buf + o, n - o, "ram_used_mb", tot ? used / 1048576.0 : -1, 0);
+    o += put_num(buf + o, n - o, "ram_total_mb", rtot, 0);
+    o += put_num(buf + o, n - o, "ram_used_mb", rused, 0);
     o += put_num(buf + o, n - o, "frametime_ms", last, 0);
     o += put_num(buf + o, n - o, "frametime_avg_ms", avg, 1);
     o += snprintf(buf + o, n - o, "}");
